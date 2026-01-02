@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Scale Auto-Tune (POC)</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="app">
+    <header class="hdr">
+      <h1>Scale Auto-Tune (POC)</h1>
+      <p class="sub">
+        Monophonic mic recording → detect first note → infer major key → map notes to nearest scale degree.
+        (RubberBand pitch-shift will be added in <code>worker.js</code>.)
+      </p>
+    </header>
+
+    <section class="card">
+      <div class="row">
+        <button id="btnStart" class="btn primary">Start recording</button>
+        <button id="btnStop" class="btn" disabled>Stop</button>
+        <button id="btnPlayRaw" class="btn" disabled>Play raw</button>
+        <button id="btnProcess" class="btn" disabled>Process → (stub)</button>
+      </div>
+
+      <div class="grid">
+        <div class="kv">
+          <div class="k">Status</div>
+          <div class="v" id="status">Idle</div>
+        </div>
+        <div class="kv">
+          <div class="k">Sample rate</div>
+          <div class="v" id="sr">—</div>
+        </div>
+        <div class="kv">
+          <div class="k">Duration</div>
+          <div class="v" id="dur">—</div>
+        </div>
+        <div class="kv">
+          <div class="k">First detected note</div>
+          <div class="v" id="firstNote">—</div>
+        </div>
+        <div class="kv">
+          <div class="k">Inferred key (major)</div>
+          <div class="v" id="keyMajor">—</div>
+        </div>
+        <div class="kv">
+          <div class="k">Mapping preview</div>
+          <div class="v" id="mapPreview">—</div>
+        </div>
+      </div>
+
+      <div class="opts">
+        <label class="field">
+          <span>Chunk size (ms)</span>
+          <input id="chunkMs" type="number" min="50" max="200" step="10" value="120" />
+        </label>
+
+        <label class="field">
+          <span>Crossfade (ms)</span>
+          <input id="xfadeMs" type="number" min="5" max="40" step="1" value="12" />
+        </label>
+
+        <label class="field">
+          <span>Silence gate (dBFS)</span>
+          <input id="gateDb" type="number" min="-80" max="-10" step="1" value="-45" />
+        </label>
+
+        <label class="field">
+          <span>Min f0 (Hz)</span>
+          <input id="minF0" type="number" min="40" max="200" step="5" value="70" />
+        </label>
+
+        <label class="field">
+          <span>Max f0 (Hz)</span>
+          <input id="maxF0" type="number" min="200" max="1200" step="10" value="900" />
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Log</h2>
+      <pre id="log" class="log"></pre>
+    </section>
+
+    <footer class="ftr">
+      <small>
+        Next step: add <code>worker.js</code> with RubberBand WASM and implement chunk pitch-shift + overlap-add.
+      </small>
+    </footer>
+  </main>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
