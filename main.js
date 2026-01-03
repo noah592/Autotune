@@ -2,8 +2,8 @@
 // Records mic audio into memory, then (after stop) does:
 // 1) simple pitch detection over chunks (AMDF-ish) + gating
 // 2) infer key as closest note to first voiced chunk
-// 3) map each chunk pitch to nearest note in major scale
-// 4) send audio to worker.js for RubberBand pitch shifting + overlap-add
+// 3) map each chunk pitch to nearest note on the major scale
+// 4) send audio to worker.js for RubberBand pitch shifting + overlap-add crossfade
 
 const $ = (id) => document.getElementById(id);
 
@@ -24,15 +24,12 @@ const ui = {
   gateDb: $("gateDb"),
   minF0: $("minF0"),
   maxF0: $("maxF0"),
-  // Optional: if you later add a button with this id, it will work automatically
-  btnPlayProcessed: $("btnPlayProcessed"),
 };
 
 function log(line) {
   ui.log.textContent += line + "\n";
   ui.log.scrollTop = ui.log.scrollHeight;
 }
-
 function setStatus(s) { ui.status.textContent = s; }
 
 let audioCtx = null;
@@ -46,93 +43,98 @@ let sampleRate = 0;
 let rawBuffer = null;
 let processedBuffer = null;
 
-// -------------------- Worker wiring --------------------
+/* ------------------------------ Worker wiring ------------------------------ */
 
-let rbWorker = null;
-let rbReady = false;
-
-// You said you don't have RubberBand bundle files.
-// For a quick PoC, point to a published WASM bundle on jsDelivr.
-// Package example: @echogarden/rubberband-wasm provides rubberband.js + rubberband.wasm. :contentReference[oaicite:1]{index=1}
-const RB_JS_URL   = "https://cdn.jsdelivr.net/npm/@echogarden/rubberband-wasm@0.2.0/rubberband.js";
+// If CDN fails for you, download these two files and place them next to index.html,
+// then set RB_JS_URL="./rubberband.js" and RB_WASM_URL="./rubberband.wasm".
+//
+// jsDelivr lists these exact files under @echogarden/rubberband-wasm@0.2.0. :contentReference[oaicite:1]{index=1}
+const RB_JS_URL = "https://cdn.jsdelivr.net/npm/@echogarden/rubberband-wasm@0.2.0/rubberband.js";
 const RB_WASM_URL = "https://cdn.jsdelivr.net/npm/@echogarden/rubberband-wasm@0.2.0/rubberband.wasm";
 
-function ensureWorker() {
-  if (rbWorker) return;
+let worker = null;
+let workerReady = false;
+let workerBusy = false;
 
-  rbWorker = new Worker("./worker.js"); // classic worker
-  rbReady = false;
+// Promise-style “wait until worker says ready”
+let workerReadyPromise = null;
+let workerReadyResolve = null;
 
-  rbWorker.onmessage = (e) => {
+function ensureWorker(settings) {
+  if (worker) return;
+
+  worker = new Worker("worker.js"); // classic worker (importScripts supported)
+
+  worker.onmessage = (e) => {
     const msg = e.data;
 
     if (msg.type === "ready") {
-      rbReady = true;
-      log("Worker ready (RubberBand loaded).");
-      setStatus("Ready");
-      ui.btnProcess.disabled = false;
+      workerReady = true;
+      log("Worker: ready");
+      if (workerReadyResolve) workerReadyResolve();
+      workerReadyResolve = null;
       return;
     }
 
     if (msg.type === "result") {
-      // msg.audio is a Float32Array whose buffer was transferred back
-      const out = msg.audio;
+      workerBusy = false;
+      const out = msg.audio; // Float32Array
       processedBuffer = floatToAudioBuffer(out, sampleRate);
-      log(`Processed audio received. frames=${msg?.debug?.frames?.length ?? "?"}`);
-      setStatus("Processed");
 
-      // Auto-play processed result for convenience
-      playBuffer(processedBuffer, "processed");
-
-      // Re-enable UI
+      log(`Worker: result received. samples=${out.length}`);
+      if (msg.debug) {
+        log(
+          `Debug: rootMidi=${msg.debug.rootMidi} chunkMs=${msg.debug.chunkMs} overlapMs=${msg.debug.overlapMs}`
+        );
+      }
+      setStatus("Processed (ready to play)");
+      // Auto-play processed for convenience
+      playProcessed();
       ui.btnProcess.disabled = false;
       return;
     }
 
     if (msg.type === "error") {
+      workerBusy = false;
       log(`WORKER ERROR: ${msg.message}`);
-      setStatus("Worker error");
+      setStatus("Worker error (see log)");
       ui.btnProcess.disabled = false;
       return;
     }
-
-    log(`Worker message: ${JSON.stringify(msg)}`);
   };
 
-  rbWorker.onerror = (err) => {
+  worker.onerror = (err) => {
+    workerBusy = false;
     log(`WORKER CRASH: ${err.message || String(err)}`);
-    setStatus("Worker crashed");
+    setStatus("Worker crashed (see log)");
     ui.btnProcess.disabled = false;
   };
-}
 
-function initWorkerIfNeeded(settings) {
-  ensureWorker();
-  if (rbReady) return;
-
-  setStatus("Loading RubberBand…");
-  log("Initializing worker…");
-
-  rbWorker.postMessage({
+  // Init handshake
+  workerReadyPromise = new Promise((resolve) => (workerReadyResolve = resolve));
+  worker.postMessage({
     type: "init",
     rbJsUrl: RB_JS_URL,
     rbWasmUrl: RB_WASM_URL,
     sampleRate,
     chunkMs: settings.chunkMs,
-    overlapMs: settings.xfadeMs,
+    overlapMs: settings.xfadeMs, // your UI calls it xfade; worker calls it overlap
   });
+
+  log("Worker: init sent");
 }
 
-// -------------------- UI handlers --------------------
+async function waitForWorkerReady() {
+  if (workerReady) return;
+  if (workerReadyPromise) await workerReadyPromise;
+}
+
+/* ------------------------------ UI handlers ------------------------------ */
 
 ui.btnStart.addEventListener("click", startRecording);
 ui.btnStop.addEventListener("click", stopRecording);
-ui.btnPlayRaw.addEventListener("click", () => playBuffer(rawBuffer, "raw"));
-ui.btnProcess.addEventListener("click", processRecording);
-
-if (ui.btnPlayProcessed) {
-  ui.btnPlayProcessed.addEventListener("click", () => playBuffer(processedBuffer, "processed"));
-}
+ui.btnPlayRaw.addEventListener("click", playRaw);
+ui.btnProcess.addEventListener("click", processWithWorker);
 
 async function startRecording() {
   try {
@@ -171,13 +173,13 @@ async function startRecording() {
       recordedLength += copy.length;
     };
 
+    // Must connect in many browsers.
     src.connect(recorderNode);
     recorderNode.connect(audioCtx.destination);
 
     ui.btnStop.disabled = false;
     ui.btnPlayRaw.disabled = true;
     ui.btnProcess.disabled = true;
-    if (ui.btnPlayProcessed) ui.btnPlayProcessed.disabled = true;
 
     ui.firstNote.textContent = "—";
     ui.keyMajor.textContent = "—";
@@ -230,7 +232,7 @@ async function stopRecording() {
     setStatus("Analyzing (pitch detect)…");
     log(`Recording stopped. samples=${mono.length}`);
 
-    // Pitch detection pass + key inference (preview only)
+    // Pitch detection pass + key inference
     const analysis = analyzeMonophonicPitch(mono, sampleRate, getSettings());
     renderAnalysis(analysis);
 
@@ -246,21 +248,35 @@ async function stopRecording() {
   }
 }
 
-function playBuffer(buf, label) {
-  if (!buf) return;
+function playRaw() {
+  if (!rawBuffer) return;
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
   const src = ctx.createBufferSource();
-  src.buffer = buf;
+  src.buffer = rawBuffer;
   src.connect(ctx.destination);
   src.start();
-  log(`Playing ${label}…`);
+  log("Playing raw recording…");
+  src.onended = () => ctx.close();
+}
+
+function playProcessed() {
+  if (!processedBuffer) {
+    log("No processed audio yet.");
+    return;
+  }
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createBufferSource();
+  src.buffer = processedBuffer;
+  src.connect(ctx.destination);
+  src.start();
+  log("Playing processed audio…");
   src.onended = () => ctx.close();
 }
 
 function getSettings() {
   return {
     chunkMs: clampInt(+ui.chunkMs.value || 120, 50, 200),
-    xfadeMs: clampInt(+ui.xfadeMs.value || 20, 5, 100),
+    xfadeMs: clampInt(+ui.xfadeMs.value || 12, 5, 40),
     gateDb: clampInt(+ui.gateDb.value || -45, -80, -10),
     minF0: clampInt(+ui.minF0.value || 70, 40, 200),
     maxF0: clampInt(+ui.maxF0.value || 900, 200, 1200),
@@ -271,48 +287,37 @@ function renderAnalysis(a) {
   ui.firstNote.textContent = a.firstNoteName ?? "—";
   ui.keyMajor.textContent = a.keyName ?? "—";
 
-  if (a.preview && a.preview.length) {
-    ui.mapPreview.textContent = a.preview.join("  ");
-  } else {
-    ui.mapPreview.textContent = "—";
-  }
+  if (a.preview && a.preview.length) ui.mapPreview.textContent = a.preview.join("  ");
+  else ui.mapPreview.textContent = "—";
 
   log(`Voiced chunks: ${a.voicedCount}/${a.totalChunks}`);
   if (a.firstHz) log(`First voiced f0: ${a.firstHz.toFixed(2)} Hz → ${a.firstNoteName}`);
   if (a.keyRootMidi != null) log(`Key inferred: ${a.keyName} (root MIDI ${a.keyRootMidi})`);
 }
 
-async function processRecording() {
+async function processWithWorker() {
   if (!rawBuffer) return;
+  if (workerBusy) return;
 
   const settings = getSettings();
 
-  // init worker (loads RubberBand) if needed
-  initWorkerIfNeeded(settings);
+  // Create/init worker (once) using current settings
+  ensureWorker(settings);
+  setStatus("Worker init…");
+  await waitForWorkerReady();
 
-  if (!rbWorker) return;
-
-  ui.btnProcess.disabled = true;
-  setStatus(rbReady ? "Processing…" : "Waiting for worker…");
-  log(`Process requested: chunk=${settings.chunkMs}ms overlap=${settings.xfadeMs}ms`);
-
-  // If worker isn't ready yet, we'll just wait; on "ready" we'll need user to click again.
-  // (Keeping it simple for POC.)
-  if (!rbReady) {
-    log("Worker is still loading RubberBand. Click Process again once it says ready.");
-    ui.btnProcess.disabled = false;
-    return;
-  }
-
-  // Send audio to worker (transfer buffer for speed)
+  // Send audio to worker for processing
   const mono = rawBuffer.getChannelData(0);
-  const send = new Float32Array(mono.length);
-  send.set(mono);
+  const copy = new Float32Array(mono.length);
+  copy.set(mono);
 
-  rbWorker.postMessage(
-    { type: "process", audio: send },
-    [send.buffer]
-  );
+  workerBusy = true;
+  ui.btnProcess.disabled = true;
+  setStatus("Processing (worker)…");
+  log(`Process: sending ${copy.length} samples to worker (chunk=${settings.chunkMs}ms overlap=${settings.xfadeMs}ms)`);
+
+  // Transfer buffer for speed
+  worker.postMessage({ type: "process", audio: copy }, [copy.buffer]);
 }
 
 /* ---------------------------- Analysis & mapping ---------------------------- */
@@ -357,29 +362,13 @@ function analyzeMonophonicPitch(mono, sr, settings) {
   }
 
   if (firstMidi == null) {
-    return {
-      totalChunks,
-      voicedCount,
-      firstHz: null,
-      firstNoteName: null,
-      keyRootMidi: null,
-      keyName: null,
-      preview: [],
-    };
+    return { totalChunks, voicedCount, firstHz: null, firstNoteName: null, keyRootMidi: null, keyName: null, preview: [] };
   }
 
   const keyRootMidi = nearestMidi(firstMidi);
   const keyName = `${midiToPitchClassName(keyRootMidi)} major`;
 
-  return {
-    totalChunks,
-    voicedCount,
-    firstHz,
-    firstNoteName: midiToNoteName(keyRootMidi),
-    keyRootMidi,
-    keyName,
-    preview,
-  };
+  return { totalChunks, voicedCount, firstHz, firstNoteName: midiToNoteName(keyRootMidi), keyRootMidi, keyName, preview };
 }
 
 /* ------------------------------ Pitch detection ----------------------------- */
@@ -396,14 +385,9 @@ function estimateF0_AMDF(frame, sr, minLag, maxLag) {
   for (let lag = minLag; lag <= maxLag; lag++) {
     let sum = 0;
     const n = x.length - lag;
-    for (let i = 0; i < n; i++) {
-      sum += Math.abs((x[i] - mean) - (x[i + lag] - mean));
-    }
+    for (let i = 0; i < n; i++) sum += Math.abs((x[i] - mean) - (x[i + lag] - mean));
     const score = sum / n;
-    if (score < bestScore) {
-      bestScore = score;
-      bestLag = lag;
-    }
+    if (score < bestScore) { bestScore = score; bestLag = lag; }
   }
 
   if (bestLag <= 0) return null;
@@ -417,12 +401,8 @@ function estimateF0_AMDF(frame, sr, minLag, maxLag) {
 
 /* ------------------------------- Music utils -------------------------------- */
 
-function hzToMidi(hz) {
-  return 69 + 12 * Math.log2(hz / 440);
-}
-function nearestMidi(m) {
-  return Math.round(m);
-}
+function hzToMidi(hz) { return 69 + 12 * Math.log2(hz / 440); }
+function nearestMidi(m) { return Math.round(m); }
 
 const PITCH_CLASS = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 const MAJOR_SCALE_STEPS = new Set([0,2,4,5,7,9,11]);
@@ -431,7 +411,6 @@ function midiToPitchClassName(midi) {
   const pc = ((midi % 12) + 12) % 12;
   return PITCH_CLASS[pc];
 }
-
 function midiToNoteName(midi) {
   const pc = ((midi % 12) + 12) % 12;
   const oct = Math.floor(midi / 12) - 1;
@@ -472,9 +451,7 @@ function calcRms(x) {
   return Math.sqrt(s / x.length);
 }
 
-function dbToLin(db) {
-  return Math.pow(10, db / 20);
-}
+function dbToLin(db) { return Math.pow(10, db / 20); }
 
 function clampInt(v, a, b) {
   v = Math.round(v);
