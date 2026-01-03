@@ -2,8 +2,8 @@
 // Records mic audio into memory, then (after stop) does:
 // 1) simple pitch detection over chunks (AMDF-ish) + gating
 // 2) infer key as closest note to first voiced chunk
-// 3) map each chunk pitch to nearest note in major scale
-// 4) (stub) send chunk plan to worker.js for RubberBand pitch shifting + overlap-add
+// 3) map each chunk pitch to nearest note on major scale
+// 4) send chunk plan to worker.js for RubberBand pitch shifting + overlap-add
 
 const $ = (id) => document.getElementById(id);
 
@@ -43,10 +43,88 @@ let recordedLength = 0;
 let sampleRate = 0;
 let rawBuffer = null;
 
+// Processed audio
+let processedBuffer = null;
+
+// --------------------------- Worker wiring (NEW) -----------------------------
+
+let worker = null;
+let pendingProcess = false;
+
+function initWorker() {
+  if (worker) return;
+
+  try {
+    worker = new Worker("worker.js");
+  } catch (e) {
+    // Some setups require module workers; if your worker uses ES modules,
+    // switch to: new Worker("worker.js", { type: "module" })
+    log("ERROR: Failed to create worker.js. If your worker is an ES module, set type:'module'.");
+    throw e;
+  }
+
+  worker.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === "log") {
+      log(`[worker] ${msg.line}`);
+      return;
+    }
+
+    if (msg.type === "error") {
+      pendingProcess = false;
+      ui.btnProcess.disabled = false;
+      setStatus("Worker error");
+      log(`WORKER ERROR: ${msg.message || "Unknown error"}`);
+      if (msg.stack) log(msg.stack);
+      return;
+    }
+
+    if (msg.type === "processed") {
+      pendingProcess = false;
+      ui.btnProcess.disabled = false;
+
+      const outSr = msg.sr || sampleRate;
+
+      if (!msg.outBuffer) {
+        setStatus("Processed (but no audio returned)");
+        log("Worker returned type=processed but outBuffer was missing.");
+        return;
+      }
+
+      // outBuffer is transferred ArrayBuffer containing Float32 PCM mono
+      const out = new Float32Array(msg.outBuffer);
+      processedBuffer = floatToAudioBuffer(out, outSr);
+
+      setStatus("Processed");
+      log(`Processed audio received: samples=${out.length} sr=${outSr}`);
+
+      // Reuse the existing play button without requiring index.html changes:
+      ui.btnPlayRaw.textContent = "Play Processed";
+      ui.btnPlayRaw.disabled = false;
+
+      return;
+    }
+
+    // Unknown message types are logged for debugging
+    log(`[worker] (unknown msg) ${JSON.stringify(msg).slice(0, 500)}`);
+  };
+
+  worker.onerror = (err) => {
+    pendingProcess = false;
+    ui.btnProcess.disabled = false;
+    setStatus("Worker crashed");
+    log(`WORKER CRASH: ${err.message || String(err)}`);
+  };
+
+  log("worker.js initialized.");
+}
+
+// ---------------------------------------------------------------------------
+
 ui.btnStart.addEventListener("click", startRecording);
 ui.btnStop.addEventListener("click", stopRecording);
-ui.btnPlayRaw.addEventListener("click", playRaw);
-ui.btnProcess.addEventListener("click", processRecordingStub);
+ui.btnPlayRaw.addEventListener("click", playRawOrProcessed);
+ui.btnProcess.addEventListener("click", processRecording);
 
 async function startRecording() {
   try {
@@ -76,6 +154,8 @@ async function startRecording() {
     recordedChunks = [];
     recordedLength = 0;
     rawBuffer = null;
+    processedBuffer = null;
+    ui.btnPlayRaw.textContent = "Play Raw";
 
     recorderNode.onaudioprocess = (e) => {
       const input = e.inputBuffer.getChannelData(0);
@@ -160,14 +240,18 @@ async function stopRecording() {
   }
 }
 
-function playRaw() {
-  if (!rawBuffer) return;
+function playRawOrProcessed() {
+  // If processed exists, play it; otherwise play raw
+  const buf = processedBuffer || rawBuffer;
+  if (!buf) return;
+
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
   const src = ctx.createBufferSource();
-  src.buffer = rawBuffer;
+  src.buffer = buf;
   src.connect(ctx.destination);
   src.start();
-  log("Playing raw recording…");
+
+  log(processedBuffer ? "Playing processed audio…" : "Playing raw recording…");
   src.onended = () => ctx.close();
 }
 
@@ -196,34 +280,57 @@ function renderAnalysis(a) {
   if (a.keyRootMidi != null) log(`Key inferred: ${a.keyName} (root MIDI ${a.keyRootMidi})`);
 }
 
-async function processRecordingStub() {
+// -------------------------- Processing (UPDATED) -----------------------------
+
+async function processRecording() {
   if (!rawBuffer) return;
+  if (pendingProcess) return;
+
+  initWorker();
 
   const settings = getSettings();
-  log(`Process requested: chunk=${settings.chunkMs}ms xfade=${settings.xfadeMs}ms (RubberBand in worker.js later)`);
+  log(`Process requested: chunk=${settings.chunkMs}ms xfade=${settings.xfadeMs}ms`);
 
-  // Build a chunk plan with target semitone shifts
+  // Build chunk plan with target semitone shifts
   const mono = rawBuffer.getChannelData(0);
   const plan = buildChunkPitchPlan(mono, sampleRate, settings);
 
-  // Placeholder: later we will send `plan` + audio to worker.js which will:
-  // - pitch shift each chunk with RubberBand
-  // - overlap-add with crossfade
-  // - return processed Float32Array for playback/download
-  log(`Chunk plan built: ${plan.chunks.length} chunks`);
-  log(`(stub) Next: implement worker.js + RubberBand WASM and call it from here.`);
-  setStatus("Processed (stub)");
+  // Build a worker-friendly payload:
+  // - transfer mono PCM as ArrayBuffer
+  // - keep plan as plain JSONable data
+  const monoCopy = new Float32Array(mono.length);
+  monoCopy.set(mono);
 
-  // Small preview of first few shifts
-  const first = plan.chunks.slice(0, 12).map(c => {
-    if (!c.voiced) return "—";
-    const s = (c.shiftSemis >= 0 ? "+" : "") + c.shiftSemis.toFixed(2);
-    return s;
-  });
-  log(`Shift preview (first chunks): ${first.join("  ")}`);
+  // If your worker expects slightly different field names, adjust here.
+  const payload = {
+    type: "process",
+    sr: sampleRate,
+    settings,
+    plan: {
+      keyRootMidi: plan.keyRootMidi,
+      chunks: plan.chunks.map(c => ({
+        start: c.start,
+        length: c.length,
+        xfade: c.xfade,
+        voiced: c.voiced,
+        shiftSemis: c.shiftSemis,
+      })),
+    },
+    monoBuffer: monoCopy.buffer, // transferred
+  };
+
+  pendingProcess = true;
+  ui.btnProcess.disabled = true;
+  ui.btnPlayRaw.disabled = true;
+  setStatus("Processing (worker)…");
+
+  // Transfer monoBuffer so we don't clone big audio data
+  worker.postMessage(payload, [payload.monoBuffer]);
+
+  log(`Sent to worker: samples=${monoCopy.length}, chunks=${payload.plan.chunks.length}`);
 }
 
-/* ---------------------------- Analysis & mapping ---------------------------- */
+// ---------------------------- Analysis & mapping ----------------------------
 
 function analyzeMonophonicPitch(mono, sr, settings) {
   const chunkSize = Math.floor(sr * (settings.chunkMs / 1000));
@@ -239,7 +346,7 @@ function analyzeMonophonicPitch(mono, sr, settings) {
   let voicedCount = 0;
   let totalChunks = 0;
 
-  // We’ll also produce a small mapping preview: "C#4→D4" etc for first voiced items
+  // mapping preview: "C#4→D4" etc for first voiced items
   const preview = [];
 
   for (let i = 0; i + chunkSize <= mono.length; i += hop) {
@@ -259,7 +366,6 @@ function analyzeMonophonicPitch(mono, sr, settings) {
       firstMidi = hzToMidi(firstHz);
     }
     if (preview.length < 10 && firstMidi != null) {
-      // For preview we need inferred key; we’ll set key as first note root
       const keyRoot = nearestMidi(firstMidi);
       const inKey = nearestMidiInMajorScale(hzToMidi(hz), keyRoot);
       preview.push(`${midiToNoteName(nearestMidi(hzToMidi(hz)))}→${midiToNoteName(inKey)}`);
@@ -328,7 +434,6 @@ function buildChunkPitchPlan(mono, sr, settings) {
         targetMidi = nearestMidiInMajorScale(midi, keyRoot);
         shiftSemis = (targetMidi - midi);
       } else {
-        // treat as unvoiced if pitch not found
         hz = null;
       }
     }
@@ -348,22 +453,18 @@ function buildChunkPitchPlan(mono, sr, settings) {
   return { keyRootMidi: keyRoot, chunks };
 }
 
-/* ------------------------------ Pitch detection ----------------------------- */
+// ------------------------------ Pitch detection -----------------------------
 
-// Simple AMDF-based estimator: choose lag with minimum average absolute diff.
-// Works okay for monophonic-ish sources; we’ll refine if needed.
 function estimateF0_AMDF(frame, sr, minLag, maxLag) {
-  // Optional: downsample for speed later; for now keep it simple.
   let bestLag = -1;
   let bestScore = Infinity;
 
-  // Light pre-emphasis / DC removal
+  // DC removal
   const x = frame;
   let mean = 0;
   for (let i = 0; i < x.length; i++) mean += x[i];
   mean /= x.length;
 
-  // AMDF over lags
   for (let lag = minLag; lag <= maxLag; lag++) {
     let sum = 0;
     const n = x.length - lag;
@@ -379,8 +480,6 @@ function estimateF0_AMDF(frame, sr, minLag, maxLag) {
 
   if (bestLag <= 0) return null;
 
-  // Basic sanity check: if score is too high relative to signal, treat as unreliable
-  // (heuristic; can tune later)
   const rms = calcRms(frame);
   if (rms < 1e-6) return null;
   if (bestScore > rms * 2.0) return null;
@@ -388,7 +487,7 @@ function estimateF0_AMDF(frame, sr, minLag, maxLag) {
   return sr / bestLag;
 }
 
-/* ------------------------------- Music utils -------------------------------- */
+// ------------------------------- Music utils --------------------------------
 
 function hzToMidi(hz) {
   return 69 + 12 * Math.log2(hz / 440);
@@ -412,10 +511,8 @@ function midiToNoteName(midi) {
 }
 
 function nearestMidiInMajorScale(midiFloat, rootMidiInt) {
-  // Find nearest integer midi that is in the major scale defined by rootMidiInt’s pitch class
   const rootPc = ((rootMidiInt % 12) + 12) % 12;
 
-  // Search outward from rounded midi
   const center = Math.round(midiFloat);
   for (let d = 0; d <= 12; d++) {
     const up = center + d;
@@ -432,13 +529,12 @@ function isInMajorScale(midiInt, rootPc) {
   return MAJOR_SCALE_STEPS.has(rel);
 }
 
-/* -------------------------------- DSP utils -------------------------------- */
+// -------------------------------- DSP utils --------------------------------
 
 function floatToAudioBuffer(mono, sr) {
   const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sr });
   const buf = ctx.createBuffer(1, mono.length, sr);
   buf.copyToChannel(mono, 0);
-  // We created a temporary context; close it immediately (buffer remains usable).
   ctx.close();
   return buf;
 }
@@ -457,3 +553,4 @@ function clampInt(v, a, b) {
   v = Math.round(v);
   return Math.max(a, Math.min(b, v));
 }
+
