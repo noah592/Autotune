@@ -2,8 +2,8 @@
 // Records mic audio into memory, then (after stop) does:
 // 1) simple pitch detection over chunks (AMDF-ish) + gating
 // 2) infer key as closest note to first voiced chunk
-// 3) map each chunk pitch to nearest note on major scale
-// 4) send chunk plan to worker.js for RubberBand pitch shifting + overlap-add
+// 3) map each chunk pitch to nearest note on the major scale
+// 4) send audio to worker.js for RubberBand pitch shifting + overlap-add
 
 const $ = (id) => document.getElementById(id);
 
@@ -12,6 +12,9 @@ const ui = {
   btnStop: $("btnStop"),
   btnPlayRaw: $("btnPlayRaw"),
   btnProcess: $("btnProcess"),
+  // Optional (if your HTML has it). We'll use it if present.
+  btnPlayProc: $("btnPlayProc"),
+
   status: $("status"),
   sr: $("sr"),
   dur: $("dur"),
@@ -33,6 +36,91 @@ function log(line) {
 
 function setStatus(s) { ui.status.textContent = s; }
 
+// -------- Worker / RubberBand wiring --------
+
+// Put your RubberBand bundle files here.
+// (These should be reachable by the worker via importScripts / fetch.)
+const RB_JS_URL = "./rubberband.js";
+const RB_WASM_URL = "./rubberband.wasm";
+
+let worker = null;
+let workerReady = false;
+let processedBuffer = null; // AudioBuffer of processed result (for playback)
+
+function ensureWorker() {
+  if (worker) return;
+
+  worker = new Worker("./worker.js"); // classic worker
+  workerReady = false;
+
+  worker.onmessage = (e) => {
+    const msg = e.data;
+
+    if (msg.type === "ready") {
+      workerReady = true;
+      log("Worker: ready (RubberBand loaded).");
+      setStatus("Ready");
+      return;
+    }
+
+    if (msg.type === "result") {
+      // msg.audio is a Float32Array whose buffer was transferred back
+      const out = msg.audio;
+      processedBuffer = floatToAudioBuffer(out, sampleRate);
+
+      log(`Worker: processed audio received. samples=${out.length}`);
+      if (msg.debug) {
+        log(
+          `Debug: rootMidi=${msg.debug.rootMidi} rootHz=${(msg.debug.rootHz || 0).toFixed(2)} ` +
+          `chunkN=${msg.debug.chunkN} overlapN=${msg.debug.overlapN}`
+        );
+      }
+
+      // Enable optional processed playback button if present
+      if (ui.btnPlayProc) ui.btnPlayProc.disabled = false;
+
+      // Convenience: auto-play processed once
+      playBuffer(processedBuffer);
+      setStatus("Processed");
+      ui.btnProcess.disabled = false;
+      return;
+    }
+
+    if (msg.type === "error") {
+      log(`WORKER ERROR: ${msg.message}`);
+      setStatus("Worker error");
+      ui.btnProcess.disabled = false;
+      return;
+    }
+  };
+
+  worker.onerror = (err) => {
+    log(`WORKER ERROR (uncaught): ${err.message || err}`);
+    setStatus("Worker error");
+    ui.btnProcess.disabled = false;
+  };
+}
+
+function initWorkerIfNeeded(settings) {
+  ensureWorker();
+  if (workerReady) return;
+
+  // Important: worker needs SR and overlapMs (we use xfadeMs as overlap)
+  worker.postMessage({
+    type: "init",
+    rbJsUrl: RB_JS_URL,
+    rbWasmUrl: RB_WASM_URL,
+    sampleRate,
+    chunkMs: settings.chunkMs,
+    overlapMs: settings.xfadeMs,
+  });
+
+  log(`Worker: init sent (rbJsUrl=${RB_JS_URL}, rbWasmUrl=${RB_WASM_URL})`);
+  setStatus("Loading RubberBand…");
+}
+
+// -------- Recording/playback state --------
+
 let audioCtx = null;
 let mediaStream = null;
 let recorderNode = null;
@@ -43,88 +131,16 @@ let recordedLength = 0;
 let sampleRate = 0;
 let rawBuffer = null;
 
-// Processed audio
-let processedBuffer = null;
-
-// --------------------------- Worker wiring (NEW) -----------------------------
-
-let worker = null;
-let pendingProcess = false;
-
-function initWorker() {
-  if (worker) return;
-
-  try {
-    worker = new Worker("worker.js");
-  } catch (e) {
-    // Some setups require module workers; if your worker uses ES modules,
-    // switch to: new Worker("worker.js", { type: "module" })
-    log("ERROR: Failed to create worker.js. If your worker is an ES module, set type:'module'.");
-    throw e;
-  }
-
-  worker.onmessage = (ev) => {
-    const msg = ev.data || {};
-    if (msg.type === "log") {
-      log(`[worker] ${msg.line}`);
-      return;
-    }
-
-    if (msg.type === "error") {
-      pendingProcess = false;
-      ui.btnProcess.disabled = false;
-      setStatus("Worker error");
-      log(`WORKER ERROR: ${msg.message || "Unknown error"}`);
-      if (msg.stack) log(msg.stack);
-      return;
-    }
-
-    if (msg.type === "processed") {
-      pendingProcess = false;
-      ui.btnProcess.disabled = false;
-
-      const outSr = msg.sr || sampleRate;
-
-      if (!msg.outBuffer) {
-        setStatus("Processed (but no audio returned)");
-        log("Worker returned type=processed but outBuffer was missing.");
-        return;
-      }
-
-      // outBuffer is transferred ArrayBuffer containing Float32 PCM mono
-      const out = new Float32Array(msg.outBuffer);
-      processedBuffer = floatToAudioBuffer(out, outSr);
-
-      setStatus("Processed");
-      log(`Processed audio received: samples=${out.length} sr=${outSr}`);
-
-      // Reuse the existing play button without requiring index.html changes:
-      ui.btnPlayRaw.textContent = "Play Processed";
-      ui.btnPlayRaw.disabled = false;
-
-      return;
-    }
-
-    // Unknown message types are logged for debugging
-    log(`[worker] (unknown msg) ${JSON.stringify(msg).slice(0, 500)}`);
-  };
-
-  worker.onerror = (err) => {
-    pendingProcess = false;
-    ui.btnProcess.disabled = false;
-    setStatus("Worker crashed");
-    log(`WORKER CRASH: ${err.message || String(err)}`);
-  };
-
-  log("worker.js initialized.");
-}
-
-// ---------------------------------------------------------------------------
-
 ui.btnStart.addEventListener("click", startRecording);
 ui.btnStop.addEventListener("click", stopRecording);
-ui.btnPlayRaw.addEventListener("click", playRawOrProcessed);
-ui.btnProcess.addEventListener("click", processRecording);
+ui.btnPlayRaw.addEventListener("click", playRaw);
+ui.btnProcess.addEventListener("click", processRecordingWithWorker);
+
+if (ui.btnPlayProc) {
+  ui.btnPlayProc.addEventListener("click", () => {
+    if (processedBuffer) playBuffer(processedBuffer);
+  });
+}
 
 async function startRecording() {
   try {
@@ -155,7 +171,7 @@ async function startRecording() {
     recordedLength = 0;
     rawBuffer = null;
     processedBuffer = null;
-    ui.btnPlayRaw.textContent = "Play Raw";
+    if (ui.btnPlayProc) ui.btnPlayProc.disabled = true;
 
     recorderNode.onaudioprocess = (e) => {
       const input = e.inputBuffer.getChannelData(0);
@@ -224,7 +240,7 @@ async function stopRecording() {
     setStatus("Analyzing (pitch detect)…");
     log(`Recording stopped. samples=${mono.length}`);
 
-    // Pitch detection pass + key inference
+    // Pitch detection pass + key inference (for UI display only)
     const analysis = analyzeMonophonicPitch(mono, sampleRate, getSettings());
     renderAnalysis(analysis);
 
@@ -240,25 +256,26 @@ async function stopRecording() {
   }
 }
 
-function playRawOrProcessed() {
-  // If processed exists, play it; otherwise play raw
-  const buf = processedBuffer || rawBuffer;
-  if (!buf) return;
+function playRaw() {
+  if (!rawBuffer) return;
+  log("Playing raw recording…");
+  playBuffer(rawBuffer);
+}
 
+function playBuffer(buf) {
+  if (!buf) return;
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
   const src = ctx.createBufferSource();
   src.buffer = buf;
   src.connect(ctx.destination);
   src.start();
-
-  log(processedBuffer ? "Playing processed audio…" : "Playing raw recording…");
   src.onended = () => ctx.close();
 }
 
 function getSettings() {
   return {
     chunkMs: clampInt(+ui.chunkMs.value || 120, 50, 200),
-    xfadeMs: clampInt(+ui.xfadeMs.value || 12, 5, 40),
+    xfadeMs: clampInt(+ui.xfadeMs.value || 12, 5, 100),
     gateDb: clampInt(+ui.gateDb.value || -45, -80, -10),
     minF0: clampInt(+ui.minF0.value || 70, 40, 200),
     maxF0: clampInt(+ui.maxF0.value || 900, 200, 1200),
@@ -280,57 +297,46 @@ function renderAnalysis(a) {
   if (a.keyRootMidi != null) log(`Key inferred: ${a.keyName} (root MIDI ${a.keyRootMidi})`);
 }
 
-// -------------------------- Processing (UPDATED) -----------------------------
+// -------- NEW: Process using worker.js --------
 
-async function processRecording() {
+async function processRecordingWithWorker() {
   if (!rawBuffer) return;
-  if (pendingProcess) return;
-
-  initWorker();
 
   const settings = getSettings();
-  log(`Process requested: chunk=${settings.chunkMs}ms xfade=${settings.xfadeMs}ms`);
 
-  // Build chunk plan with target semitone shifts
-  const mono = rawBuffer.getChannelData(0);
-  const plan = buildChunkPitchPlan(mono, sampleRate, settings);
-
-  // Build a worker-friendly payload:
-  // - transfer mono PCM as ArrayBuffer
-  // - keep plan as plain JSONable data
-  const monoCopy = new Float32Array(mono.length);
-  monoCopy.set(mono);
-
-  // If your worker expects slightly different field names, adjust here.
-  const payload = {
-    type: "process",
-    sr: sampleRate,
-    settings,
-    plan: {
-      keyRootMidi: plan.keyRootMidi,
-      chunks: plan.chunks.map(c => ({
-        start: c.start,
-        length: c.length,
-        xfade: c.xfade,
-        voiced: c.voiced,
-        shiftSemis: c.shiftSemis,
-      })),
-    },
-    monoBuffer: monoCopy.buffer, // transferred
-  };
-
-  pendingProcess = true;
   ui.btnProcess.disabled = true;
-  ui.btnPlayRaw.disabled = true;
-  setStatus("Processing (worker)…");
+  setStatus("Processing…");
 
-  // Transfer monoBuffer so we don't clone big audio data
-  worker.postMessage(payload, [payload.monoBuffer]);
+  initWorkerIfNeeded(settings);
 
-  log(`Sent to worker: samples=${monoCopy.length}, chunks=${payload.plan.chunks.length}`);
+  // If worker is still loading RubberBand, we'll still send process;
+  // worker will error if not ready. So we wait until ready.
+  if (!workerReady) {
+    // Poll lightly (simple PoC). You can replace with a Promise handshake later.
+    const t0 = performance.now();
+    while (!workerReady && performance.now() - t0 < 10000) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+    if (!workerReady) {
+      log("ERROR: Worker did not become ready (RubberBand not loaded).");
+      setStatus("Worker not ready");
+      ui.btnProcess.disabled = false;
+      return;
+    }
+  }
+
+  const mono = rawBuffer.getChannelData(0);
+
+  // IMPORTANT: We transfer the buffer to the worker. That would detach it,
+  // so we send a copy.
+  const payload = new Float32Array(mono.length);
+  payload.set(mono);
+
+  log(`Sending to worker: samples=${payload.length}, chunk=${settings.chunkMs}ms overlap=${settings.xfadeMs}ms`);
+  worker.postMessage({ type: "process", audio: payload }, [payload.buffer]);
 }
 
-// ---------------------------- Analysis & mapping ----------------------------
+/* ---------------------------- Analysis & mapping ---------------------------- */
 
 function analyzeMonophonicPitch(mono, sr, settings) {
   const chunkSize = Math.floor(sr * (settings.chunkMs / 1000));
@@ -346,7 +352,7 @@ function analyzeMonophonicPitch(mono, sr, settings) {
   let voicedCount = 0;
   let totalChunks = 0;
 
-  // mapping preview: "C#4→D4" etc for first voiced items
+  // We’ll also produce a small mapping preview: "C#4→D4" etc for first voiced items
   const preview = [];
 
   for (let i = 0; i + chunkSize <= mono.length; i += hop) {
@@ -366,6 +372,7 @@ function analyzeMonophonicPitch(mono, sr, settings) {
       firstMidi = hzToMidi(firstHz);
     }
     if (preview.length < 10 && firstMidi != null) {
+      // For preview we need inferred key; we’ll set key as first note root
       const keyRoot = nearestMidi(firstMidi);
       const inKey = nearestMidiInMajorScale(hzToMidi(hz), keyRoot);
       preview.push(`${midiToNoteName(nearestMidi(hzToMidi(hz)))}→${midiToNoteName(inKey)}`);
@@ -398,73 +405,20 @@ function analyzeMonophonicPitch(mono, sr, settings) {
   };
 }
 
-function buildChunkPitchPlan(mono, sr, settings) {
-  const chunkSize = Math.floor(sr * (settings.chunkMs / 1000));
-  const xfade = Math.floor(sr * (settings.xfadeMs / 1000));
-  const hop = chunkSize; // Later, we can do hop = chunkSize - xfade for nicer continuity.
+/* ------------------------------ Pitch detection ----------------------------- */
 
-  const gateLin = dbToLin(settings.gateDb);
-  const minLag = Math.floor(sr / settings.maxF0);
-  const maxLag = Math.floor(sr / settings.minF0);
-
-  // First pass: find first voiced chunk and set key root
-  let keyRoot = null;
-  for (let i = 0; i + chunkSize <= mono.length; i += hop) {
-    const slice = mono.subarray(i, i + chunkSize);
-    if (calcRms(slice) < gateLin) continue;
-    const hz = estimateF0_AMDF(slice, sr, minLag, maxLag);
-    if (!hz) continue;
-    const midi = hzToMidi(hz);
-    keyRoot = nearestMidi(midi);
-    break;
-  }
-
-  const chunks = [];
-  for (let i = 0; i + chunkSize <= mono.length; i += hop) {
-    const slice = mono.subarray(i, i + chunkSize);
-    const rms = calcRms(slice);
-    const voiced = rms >= gateLin && keyRoot != null;
-
-    let hz = null, midi = null, targetMidi = null, shiftSemis = 0;
-
-    if (voiced) {
-      hz = estimateF0_AMDF(slice, sr, minLag, maxLag);
-      if (hz && hz >= settings.minF0 && hz <= settings.maxF0) {
-        midi = hzToMidi(hz);
-        targetMidi = nearestMidiInMajorScale(midi, keyRoot);
-        shiftSemis = (targetMidi - midi);
-      } else {
-        hz = null;
-      }
-    }
-
-    chunks.push({
-      start: i,
-      length: chunkSize,
-      xfade,
-      voiced: Boolean(hz) && keyRoot != null,
-      f0Hz: hz,
-      midi,
-      targetMidi,
-      shiftSemis,
-    });
-  }
-
-  return { keyRootMidi: keyRoot, chunks };
-}
-
-// ------------------------------ Pitch detection -----------------------------
-
+// Simple AMDF-based estimator: choose lag with minimum average absolute diff.
 function estimateF0_AMDF(frame, sr, minLag, maxLag) {
   let bestLag = -1;
   let bestScore = Infinity;
 
-  // DC removal
+  // Light pre-emphasis / DC removal
   const x = frame;
   let mean = 0;
   for (let i = 0; i < x.length; i++) mean += x[i];
   mean /= x.length;
 
+  // AMDF over lags
   for (let lag = minLag; lag <= maxLag; lag++) {
     let sum = 0;
     const n = x.length - lag;
@@ -480,6 +434,7 @@ function estimateF0_AMDF(frame, sr, minLag, maxLag) {
 
   if (bestLag <= 0) return null;
 
+  // Basic sanity check (heuristic)
   const rms = calcRms(frame);
   if (rms < 1e-6) return null;
   if (bestScore > rms * 2.0) return null;
@@ -487,7 +442,7 @@ function estimateF0_AMDF(frame, sr, minLag, maxLag) {
   return sr / bestLag;
 }
 
-// ------------------------------- Music utils --------------------------------
+/* ------------------------------- Music utils -------------------------------- */
 
 function hzToMidi(hz) {
   return 69 + 12 * Math.log2(hz / 440);
@@ -513,6 +468,7 @@ function midiToNoteName(midi) {
 function nearestMidiInMajorScale(midiFloat, rootMidiInt) {
   const rootPc = ((rootMidiInt % 12) + 12) % 12;
 
+  // Search outward from rounded midi
   const center = Math.round(midiFloat);
   for (let d = 0; d <= 12; d++) {
     const up = center + d;
@@ -529,7 +485,7 @@ function isInMajorScale(midiInt, rootPc) {
   return MAJOR_SCALE_STEPS.has(rel);
 }
 
-// -------------------------------- DSP utils --------------------------------
+/* -------------------------------- DSP utils -------------------------------- */
 
 function floatToAudioBuffer(mono, sr) {
   const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sr });
@@ -553,4 +509,3 @@ function clampInt(v, a, b) {
   v = Math.round(v);
   return Math.max(a, Math.min(b, v));
 }
-
