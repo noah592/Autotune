@@ -13,6 +13,8 @@
 //   with an async `create({ wasmURL })` that returns { pitchShift(input, ratio): Float32Array }.
 //   If your RubberBand bundle differs, adapt `loadRubberBand()` accordingly.
 
+console.log("worker.js loaded");
+
 let SR = 48000;
 let CHUNK_MS = 120;     // 50–200ms recommended
 let OVERLAP_MS = 20;    // crossfade overlap
